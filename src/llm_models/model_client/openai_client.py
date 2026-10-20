@@ -203,6 +203,13 @@ PROVIDER_REASONING_KEYS_BY_DOMAIN: Dict[str, str] = {
 }
 """按 provider 域名指定的原生推理字段名。"""
 
+PROVIDER_SESSION_HEADERS_BY_DOMAIN: Dict[str, str] = {
+    "opencode.ai": "x-opencode-session",
+}
+"""按 provider 域名指定的会话请求头名称。
+
+OpenCode Go 要求客户端为每段会话发送稳定 ID，用于路由与 Prompt 缓存优化；缺失时请求会被直接拒绝。"""
+
 
 def _build_fallback_tool_call_id(prefix: str) -> str:
     """为缺失原始调用 ID 的工具调用生成唯一兜底标识。"""
@@ -224,6 +231,16 @@ def _set_tool_call_source(tool_call: ToolCall, source: str) -> ToolCall:
     extra_content[TOOL_CALL_SOURCE_EXTRA_KEY] = source
     tool_call.extra_content = extra_content
     return tool_call
+
+
+def _build_provider_session_header_name(base_url: str) -> str | None:
+    """根据 provider 的 base_url 解析需要补全的会话请求头名称。"""
+    normalized_base_url = base_url.strip()
+    if not normalized_base_url:
+        return None
+    parsed_url = urlparse(normalized_base_url if "://" in normalized_base_url else f"//{normalized_base_url}")
+    provider_hostname = (parsed_url.hostname or "").lower()
+    return PROVIDER_SESSION_HEADERS_BY_DOMAIN.get(provider_hostname)
 
 
 def _build_reasoning_key(api_provider: APIProvider) -> str:
@@ -1469,20 +1486,56 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
         # SDK 将这些资源定义为 cached_property；这里只构造资源，不发起请求。
         _ = self.client.chat.completions, self.client.embeddings, self.client.audio.transcriptions, self.client.responses
 
-    def _build_request_headers(self, extra_headers: Dict[str, str]) -> Dict[str, str | Omit] | None:
+    def _build_request_headers(
+        self,
+        extra_headers: Dict[str, str],
+        trace_context: RequestTraceContext | None = None,
+    ) -> Dict[str, str | Omit] | None:
         """构造单次请求的附加请求头。
 
         Args:
             extra_headers: 模型 `extra_params` 中声明的附加请求头。
+            trace_context: 当前逻辑请求的追踪上下文，用于向需要会话 ID 的服务商补全会话头。
 
         Returns:
             Dict[str, str | Omit] | None: 传给 SDK 的 `extra_headers`；鉴权不交给 SDK 时
             会显式省略占位密钥生成的 `Authorization` 头。
         """
-        request_headers: Dict[str, str | Omit] = dict(_canonicalize_authorization_header(extra_headers))
+        merged_headers = self._apply_provider_session_header(extra_headers, trace_context)
+        request_headers: Dict[str, str | Omit] = dict(_canonicalize_authorization_header(merged_headers))
         if self._omit_sdk_authorization:
             request_headers.setdefault(_AUTHORIZATION_HEADER, omit)
         return request_headers or None
+
+    def _apply_provider_session_header(
+        self,
+        extra_headers: Dict[str, str],
+        trace_context: RequestTraceContext | None,
+    ) -> Dict[str, str]:
+        """为要求会话头的服务商补全稳定会话 ID。
+
+        模型 `extra_params` 中显式声明的同名请求头优先，不被覆盖。
+        """
+        session_header_name = _build_provider_session_header_name(self.api_provider.base_url)
+        if not session_header_name or session_header_name in extra_headers:
+            return extra_headers
+        merged_headers = dict(extra_headers)
+        merged_headers[session_header_name] = self._resolve_provider_session_id(trace_context)
+        return merged_headers
+
+    @staticmethod
+    def _resolve_provider_session_id(trace_context: RequestTraceContext | None) -> str:
+        """解析发送给服务商的会话 ID。
+
+        聊天上下文优先使用真实聊天流 ID，保证同一会话的请求路由稳定；
+        非聊天上下文退回逻辑请求 ID，临时请求（如失败回放）再退回一次性随机 ID。
+        """
+        if trace_context is not None:
+            if trace_context.session_id:
+                return trace_context.session_id
+            if trace_context.request_id:
+                return trace_context.request_id
+        return uuid4().hex
 
     def _build_default_stream_response_handler(
         self,
@@ -1644,7 +1697,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                             max_tokens=max_tokens_argument,
                             stream=True,
                             response_format=openai_response_format,
-                            extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                            extra_headers=self._build_request_headers(request_overrides.extra_headers, request.trace_context),
                             extra_query=request_overrides.extra_query or None,
                             extra_body=extra_body or None,
                         )
@@ -1673,7 +1726,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                         max_tokens=max_tokens_argument,
                         stream=False,
                         response_format=openai_response_format,
-                        extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                        extra_headers=self._build_request_headers(request_overrides.extra_headers, request.trace_context),
                         extra_query=request_overrides.extra_query or None,
                         extra_body=extra_body or None,
                     )
@@ -1850,7 +1903,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             raw_response = await self.client.embeddings.create(
                 model=model_info.model_identifier,
                 input=cast(Any, image_input),
-                extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                extra_headers=self._build_request_headers(request_overrides.extra_headers, request.trace_context),
                 extra_query=request_overrides.extra_query or None,
                 extra_body=request_overrides.extra_body or None,
             )
@@ -1920,7 +1973,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             },
         }
         options: Dict[str, Any] = {}
-        request_headers = self._build_request_headers(native_request.extra_headers)
+        request_headers = self._build_request_headers(native_request.extra_headers, request.trace_context)
         if request_headers:
             options["headers"] = request_headers
         if native_request.extra_query:
@@ -2005,7 +2058,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             raw_response = await self.client.embeddings.create(
                 model=model_info.model_identifier,
                 input=embedding_input,
-                extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                extra_headers=self._build_request_headers(request_overrides.extra_headers, request.trace_context),
                 extra_query=request_overrides.extra_query or None,
                 extra_body=request_overrides.extra_body or None,
             )
@@ -2119,7 +2172,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             raw_response = await self.client.audio.transcriptions.create(
                 model=model_info.model_identifier,
                 file=audio_file,
-                extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                extra_headers=self._build_request_headers(request_overrides.extra_headers, request.trace_context),
                 extra_query=request_overrides.extra_query or None,
                 extra_body=request_overrides.extra_body or None,
             )
